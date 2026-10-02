@@ -1,0 +1,121 @@
+//! Read-only view over Claude Code's on-disk sessions (~/.claude).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::SystemTime;
+
+pub fn claude_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".claude")
+}
+
+pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
+    let projects = claude_dir().join("projects");
+    std::fs::read_dir(projects).ok()?.flatten().map(|d| d.path().join(format!("{session_id}.jsonl"))).find(|p| p.exists())
+}
+
+fn short(session_id: &str) -> &str {
+    &session_id[..session_id.len().min(8)]
+}
+
+fn job_dir(session_id: &str) -> PathBuf {
+    claude_dir().join("jobs").join(short(session_id))
+}
+
+pub fn is_background_job(session_id: &str) -> bool {
+    job_dir(session_id).join("state.json").exists()
+}
+
+/// Latest one-line status a background job reported, if any.
+pub fn job_detail(session_id: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(job_dir(session_id).join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(format!("{} — {}", v["state"].as_str().unwrap_or("?"), v["detail"].as_str().unwrap_or("")))
+}
+
+/// Name shown in the agents list (agent-name / ai-title record), falling back to the short id.
+pub fn display_name(session_id: &str) -> String {
+    transcript_path(session_id)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| {
+            raw.lines().rev().find_map(|l| {
+                if !(l.contains("\"agent-name\"") || l.contains("\"ai-title\"")) {
+                    return None;
+                }
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                v["agentName"].as_str().or(v["aiTitle"].as_str()).map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| short(session_id).to_string())
+}
+
+#[derive(Default)]
+pub struct NameCache(HashMap<String, String>);
+
+impl NameCache {
+    pub fn get(&mut self, session_id: &str) -> &str {
+        self.0.entry(session_id.to_string()).or_insert_with(|| display_name(session_id))
+    }
+}
+
+/// Command that reopens a session: attach for background jobs, resume otherwise.
+pub fn open_command(session_id: &str, cwd: &str) -> Command {
+    let mut cmd = Command::new("claude");
+    if is_background_job(session_id) {
+        cmd.args(["attach", short(session_id)]);
+    } else {
+        cmd.args(["--resume", session_id]);
+    }
+    if Path::new(cwd).is_dir() {
+        cmd.current_dir(cwd);
+    }
+    cmd
+}
+
+/// What a session has been saying lately: last few assistant text replies.
+pub struct Activity {
+    pub session_id: String,
+    pub name: String,
+    pub job: Option<String>,
+    pub recent: Vec<String>,
+}
+
+pub fn recent_activity(since: SystemTime, limit: usize) -> Vec<Activity> {
+    let Ok(projects) = std::fs::read_dir(claude_dir().join("projects")) else { return vec![] };
+    let mut files: Vec<(SystemTime, PathBuf)> = projects
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d.path()).ok())
+        .flat_map(|rd| rd.flatten())
+        .filter(|f| f.path().extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|f| Some((f.metadata().ok()?.modified().ok()?, f.path())))
+        .filter(|(m, _)| *m >= since)
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files
+        .into_iter()
+        .take(limit)
+        .filter_map(|(_, p)| {
+            let sid = p.file_stem()?.to_str()?.to_string();
+            let raw = std::fs::read_to_string(&p).ok()?;
+            let mut recent: Vec<String> = raw
+                .lines()
+                .rev()
+                .filter(|l| l.contains("\"type\":\"assistant\""))
+                .filter_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    let text: String = v["message"]["content"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| c["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    (!text.trim().is_empty()).then(|| text.chars().take(500).collect())
+                })
+                .take(3)
+                .collect();
+            recent.reverse();
+            Some(Activity { name: display_name(&sid), job: job_detail(&sid), session_id: sid, recent })
+        })
+        .collect()
+}
