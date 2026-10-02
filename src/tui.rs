@@ -291,8 +291,8 @@ impl App {
                     self.act(r, Some(l.todo_id));
                     Mode::Normal
                 }
-                KeyCode::Enter => {
-                    self.open_session(&links[idx].clone(), terminal);
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    self.open_session(&links[idx].clone(), k.code != KeyCode::Enter, terminal);
                     return;
                 }
                 _ => Mode::Normal,
@@ -360,8 +360,16 @@ impl App {
         }
     }
 
-    fn open_session(&mut self, link: &SessionLink, terminal: &mut DefaultTerminal) {
+    fn open_session(&mut self, link: &SessionLink, jump: bool, terminal: &mut DefaultTerminal) {
         let name = self.names.get(&link.session_id).to_string();
+        if sessions::in_tmux() {
+            self.status = match sessions::tmux_open(&link.session_id, &link.cwd, &name, jump) {
+                Ok((at, false)) => format!("Opened “{name}” in {at}."),
+                Ok((at, true)) => format!("“{name}” already open in {at}."),
+                Err(e) => format!("couldn't open session: {e}"),
+            };
+            return;
+        }
         let mut cmd = sessions::open_command(&link.session_id, &link.cwd);
         match suspend(terminal, &mut cmd) {
             Ok(_) => self.status = format!("Back from “{name}”."),
@@ -458,11 +466,11 @@ impl App {
                     self.act(r, Some(m));
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('o') => {
                 let links: Vec<SessionLink> = self.tree.sessions_for(id).into_iter().cloned().collect();
                 match links.len() {
                     0 => self.status = "Not attached to a session. Run /claim inside one.".into(),
-                    1 => self.open_session(&links[0], terminal),
+                    1 => self.open_session(&links[0], k.code != KeyCode::Enter, terminal),
                     _ => self.mode = Mode::PickSession { links, idx: 0 },
                 }
             }
@@ -517,7 +525,7 @@ impl App {
                         let s = format!("{} {}  ({})", if i == *idx { "›" } else { " " }, name, &l.session_id[..8.min(l.session_id.len())]);
                         Line::from(s)
                     })
-                    .chain([Line::from(""), Line::from("⏎ open · d detach · esc cancel").style(Style::default().fg(Color::DarkGray))])
+                    .chain([Line::from(""), Line::from("⏎ open · o open + jump · d detach · esc cancel").style(Style::default().fg(Color::DarkGray))])
                     .collect();
                 let h = lines.len() as u16 + 2;
                 popup(f, "sessions", lines, 70, h);
@@ -604,7 +612,8 @@ Shift-Tab   un-nest
 J / K       move down / up among siblings
 h/l ←/→     collapse / expand
 m then p    move item inside another (P = after it)
-⏎           open the Claude session attached to it
+⏎           open its Claude session (tmux: background window)
+o           open and jump to it
 
 t           start a timer (minutes)
 T           stop timer

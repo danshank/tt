@@ -59,18 +59,68 @@ impl NameCache {
     }
 }
 
-/// Command that reopens a session: attach for background jobs, resume otherwise.
+/// Args to `claude` that reopen a session: attach for background jobs, resume otherwise.
+fn open_args(session_id: &str) -> [&str; 2] {
+    if is_background_job(session_id) {
+        ["attach", short(session_id)]
+    } else {
+        ["--resume", session_id]
+    }
+}
+
+/// Command that reopens a session in the current terminal.
 pub fn open_command(session_id: &str, cwd: &str) -> Command {
     let mut cmd = Command::new("claude");
-    if is_background_job(session_id) {
-        cmd.args(["attach", short(session_id)]);
-    } else {
-        cmd.args(["--resume", session_id]);
-    }
+    cmd.args(open_args(session_id));
     if Path::new(cwd).is_dir() {
         cmd.current_dir(cwd);
     }
     cmd
+}
+
+pub fn in_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
+fn tmux(args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("tmux").args(args).output()?;
+    if !out.status.success() {
+        anyhow::bail!("tmux {}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Open a session in its own window of the dedicated tmux session ($TT_TMUX_SESSION, default "claude"),
+/// reusing the window if one already runs it. `jump` switches the client there. Returns "session:index".
+pub fn tmux_open(session_id: &str, cwd: &str, name: &str, jump: bool) -> anyhow::Result<(String, bool)> {
+    let existing = tmux(&["list-windows", "-a", "-F", "#{@tt_session}\t#{window_id}"])?
+        .lines()
+        .find_map(|l| l.split_once('\t').filter(|(s, _)| *s == session_id).map(|(_, w)| w.to_string()));
+    let reused = existing.is_some();
+    let window = match existing {
+        Some(w) => w,
+        None => {
+            let target = std::env::var("TT_TMUX_SESSION").unwrap_or_else(|_| "claude".into());
+            let cwd = if Path::new(cwd).is_dir() { cwd } else { "." };
+            let target_arg = format!("={target}:");
+            let mut args = if tmux(&["has-session", "-t", &format!("={target}")]).is_ok() {
+                vec!["new-window", "-t", &target_arg]
+            } else {
+                vec!["new-session", "-s", &target]
+            };
+            args.extend(["-d", "-P", "-F", "#{window_id}", "-n", name, "-c", cwd, "claude"]);
+            args.extend(open_args(session_id));
+            let w = tmux(&args)?;
+            tmux(&["set-option", "-w", "-t", &w, "@tt_session", session_id])?;
+            w
+        }
+    };
+    if jump {
+        tmux(&["select-window", "-t", &window])?;
+        tmux(&["switch-client", "-t", &window])?;
+    }
+    let label = tmux(&["display-message", "-p", "-t", &window, "#{session_name}:#{window_index}"])?;
+    Ok((label, reused))
 }
 
 /// What a session has been saying lately: last few assistant text replies.
