@@ -1,0 +1,1 @@
+{ "name": "tt-claim", "version": "0.1.0", "description": "/claim: pick a tt todo in a pane and link it to this session", "types": "./types/index.d.ts" }

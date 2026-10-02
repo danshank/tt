@@ -34,6 +34,8 @@ enum Cmd {
         parent: Option<TodoId>,
         #[arg(long)]
         claim: bool,
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Link a todo to the current Claude session (or --session)
     Claim {
@@ -104,10 +106,10 @@ fn main() -> Result<()> {
                 print_tree(&store, all)?;
             }
         }
-        Some(Cmd::Add { title, parent, claim }) => {
+        Some(Cmd::Add { title, parent, claim, session }) => {
             let id = store.add(&title, parent, None)?;
             if claim {
-                store.link_session(id, &session_id(None)?, &cwd())?;
+                store.link_session(id, &session_id(session)?, &cwd())?;
             }
             println!("added #{id}: {}", store.load()?.path(id));
         }
