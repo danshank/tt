@@ -8,7 +8,7 @@ const PANE = 'tt-claim'
 const rows = atom({ plugin: 'tt-claim', key: 'rows' } as const, [])
 const error = atom({ plugin: 'tt-claim', key: 'error' } as const, '')
 
-const TT = ['tt', '/Users/dan/.cargo/bin/tt']
+const TT = ['tt', '/Users/dan/Software/personal/tt/target/debug/tt']
 
 async function tt($: EngineInterface, args: string[]) {
   const cwd = await $.session.cwd()
@@ -19,7 +19,7 @@ async function tt($: EngineInterface, args: string[]) {
       // try the next location
     }
   }
-  throw new Error('tt not found on PATH or in ~/.cargo/bin')
+  throw new Error('tt not found on PATH or in target/debug')
 }
 
 async function refresh($: EngineInterface) {

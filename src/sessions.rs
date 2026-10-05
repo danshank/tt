@@ -82,6 +82,26 @@ pub fn in_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
 
+/// Edit `initial` in nvim inside a small tmux popup. None if the user quit without writing.
+pub fn tmux_edit(title: &str, initial: &str) -> anyhow::Result<Option<String>> {
+    let path = std::env::temp_dir().join(format!("tt-input-{}.txt", std::process::id()));
+    std::fs::write(&path, initial)?;
+    let before = std::fs::metadata(&path)?.modified()?;
+    let nvim = format!(
+        "nvim --clean -n -c 'set laststatus=0 noshowmode noruler nonumber norelativenumber signcolumn=no nowrap fillchars=eob:\\  shortmess+=W' \
+         -c 'nnoremap <buffer> <CR> <Cmd>silent wq<CR>' -c 'inoremap <buffer> <CR> <Cmd>silent wq<CR>' -c 'startinsert!' '{}'",
+        path.display()
+    );
+    let status = Command::new("tmux").args(["display-popup", "-E", "-x", "C", "-y", "C", "-w", "72", "-h", "5", "-T", &format!(" {title} "), &nvim]).status();
+    let saved = std::fs::metadata(&path)?.modified()? != before;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    if !status?.success() || !saved {
+        return Ok(None);
+    }
+    Ok(Some(text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")))
+}
+
 fn tmux(args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("tmux").args(args).output()?;
     if !out.status.success() {

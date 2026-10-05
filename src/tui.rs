@@ -22,6 +22,17 @@ enum InputKind {
     Timer,
 }
 
+impl InputKind {
+    fn label(&self) -> &'static str {
+        match self {
+            InputKind::Sibling => "new todo",
+            InputKind::Child => "new child todo",
+            InputKind::Edit(_) => "edit",
+            InputKind::Timer => "timer minutes",
+        }
+    }
+}
+
 enum Mode {
     Normal,
     Input { kind: InputKind, buf: String },
@@ -327,6 +338,21 @@ impl App {
         };
     }
 
+    fn prompt(&mut self, kind: InputKind, buf: String) {
+        if !sessions::in_tmux() {
+            self.mode = Mode::Input { kind, buf };
+            return;
+        }
+        match sessions::tmux_edit(kind.label(), &buf) {
+            Ok(Some(text)) => self.submit(kind, text),
+            Ok(None) => {}
+            Err(e) => {
+                self.status = format!("editor popup failed: {e}");
+                self.mode = Mode::Input { kind, buf };
+            }
+        }
+    }
+
     fn submit(&mut self, kind: InputKind, buf: String) {
         let cur = self.selected();
         match kind {
@@ -388,9 +414,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Char('g') => self.cursor = 0,
             KeyCode::Char('G') => self.cursor = last,
-            KeyCode::Char('a') => self.mode = Mode::Input { kind: InputKind::Sibling, buf: String::new() },
-            KeyCode::Char('A') => self.mode = Mode::Input { kind: InputKind::Child, buf: String::new() },
-            KeyCode::Char('t') => self.mode = Mode::Input { kind: InputKind::Timer, buf: "25".into() },
+            KeyCode::Char('a') => self.prompt(InputKind::Sibling, String::new()),
+            KeyCode::Char('A') => self.prompt(InputKind::Child, String::new()),
+            KeyCode::Char('t') => self.prompt(InputKind::Timer, "25".into()),
             KeyCode::Char('T') => {
                 self.timer = None;
                 self.status = "Timer stopped.".into();
@@ -415,7 +441,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 let buf = self.tree.get(id).map(|t| t.title.clone()).unwrap_or_default();
-                self.mode = Mode::Input { kind: InputKind::Edit(id), buf };
+                self.prompt(InputKind::Edit(id), buf);
             }
             KeyCode::Char('d') => self.mode = Mode::ConfirmDelete(id),
             KeyCode::Tab => {
@@ -502,13 +528,7 @@ impl App {
             Mode::Normal => {}
             Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 24),
             Mode::Input { kind, buf } => {
-                let label = match kind {
-                    InputKind::Sibling => "new todo",
-                    InputKind::Child => "new child todo",
-                    InputKind::Edit(_) => "edit",
-                    InputKind::Timer => "timer minutes",
-                };
-                popup(f, label, vec![Line::from(format!("{buf}▏"))], 70, 3);
+                popup(f, kind.label(), vec![Line::from(format!("{buf}▏"))], 70, 3);
             }
             Mode::ConfirmDelete(id) => {
                 let n = self.tree.todos.iter().filter(|t| t.id != *id && self.tree.is_within(t.id, *id)).count();
