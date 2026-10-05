@@ -4,7 +4,7 @@ mod store;
 mod suggest;
 mod tui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use domain::TodoId;
 use std::collections::HashSet;
@@ -32,6 +32,9 @@ enum Cmd {
         title: String,
         #[arg(long)]
         parent: Option<TodoId>,
+        /// Place right below this todo, as its sibling
+        #[arg(long, conflicts_with = "parent")]
+        after: Option<TodoId>,
         #[arg(long)]
         claim: bool,
         #[arg(long)]
@@ -112,8 +115,15 @@ fn main() -> Result<()> {
                 print_tree(&store, all)?;
             }
         }
-        Some(Cmd::Add { title, parent, claim, session }) => {
-            let id = store.add(&title, parent, None)?;
+        Some(Cmd::Add { title, parent, after, claim, session }) => {
+            let (parent, index) = match after {
+                Some(a) => {
+                    let t = store.load()?.get(a).cloned().with_context(|| format!("no todo #{a}"))?;
+                    (t.parent_id, Some(t.position as usize + 1))
+                }
+                None => (parent, None),
+            };
+            let id = store.add(&title, parent, index)?;
             if claim {
                 store.link_session(id, &session_id(session)?, &cwd())?;
             }
