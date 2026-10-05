@@ -55,6 +55,7 @@ struct App {
     cursor: usize,
     collapsed: HashSet<TodoId>,
     show_all_done: bool,
+    recent: bool,
     moving: Option<TodoId>,
     mode: Mode,
     timer: Option<Timer>,
@@ -74,6 +75,7 @@ pub fn run(store: Store) -> Result<()> {
         cursor: 0,
         collapsed: HashSet::new(),
         show_all_done: false,
+        recent: false,
         moving: None,
         mode: Mode::Normal,
         timer: None,
@@ -162,7 +164,7 @@ impl App {
         let today = today();
         let show_all = self.show_all_done;
         let hidden = move |t: &Todo| !show_all && t.done_at.as_deref().is_some_and(|d| !d.starts_with(&today));
-        self.rows = self.tree.rows(&self.collapsed, &hidden);
+        self.rows = if self.recent { self.tree.done_rows() } else { self.tree.rows(&self.collapsed, &hidden) };
         if let Some(id) = keep {
             if let Some(i) = self.rows.iter().position(|r| r.id == id) {
                 self.cursor = i;
@@ -481,6 +483,12 @@ impl App {
                 self.show_all_done = !self.show_all_done;
                 self.recompute(cur);
             }
+            KeyCode::Char('R') => {
+                self.recent = !self.recent;
+                self.moving = None;
+                self.cursor = 0;
+                self.recompute(cur);
+            }
             KeyCode::Esc => {
                 self.moving = None;
                 self.status.clear();
@@ -488,6 +496,14 @@ impl App {
             _ => {}
         }
         let Some(id) = cur else { return };
+        let structural = matches!(
+            k.code,
+            KeyCode::Char('a' | 'A' | 'J' | 'K' | 'h' | 'l' | 'm' | 'p' | 'P') | KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+        );
+        if self.recent && structural {
+            self.status = "Not in recent view. R to go back to the tree.".into();
+            return;
+        }
         match k.code {
             KeyCode::Char(' ') | KeyCode::Char('x') => {
                 let done = self.tree.get(id).is_some_and(|t| t.is_done());
@@ -565,14 +581,19 @@ impl App {
 
         let rows = self.rows.clone();
         let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(self.row_line(r))).collect();
-        let title = if self.show_all_done { " todos (all) " } else { " todos " };
+        let title = match (self.recent, self.show_all_done) {
+            (true, _) => " recently done ",
+            (false, true) => " todos (all) ",
+            (false, false) => " todos ",
+        };
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
         let mut state = ListState::default().with_selected((!self.rows.is_empty()).then_some(self.cursor));
         f.render_stateful_widget(list, main, &mut state);
         if self.rows.is_empty() {
-            let hint = Paragraph::new("No todos yet. Press a to add one.").style(Style::default().fg(Color::DarkGray));
+            let hint = if self.recent { "Nothing checked off yet." } else { "No todos yet. Press a to add one." };
+            let hint = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
             f.render_widget(hint, Rect { x: main.x + 2, y: main.y + 1, width: main.width.saturating_sub(4), height: 1 });
         }
 
@@ -581,7 +602,7 @@ impl App {
 
         match &self.mode {
             Mode::Normal => {}
-            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 24),
+            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 26),
             Mode::Input { kind: kind @ InputKind::Dir(_), buf } => {
                 let (_, names) = dir_matches(buf);
                 let mut lines = vec![Line::from(format!("{buf}▏"))];
@@ -620,6 +641,19 @@ impl App {
 
     fn row_line(&mut self, r: &Row) -> Line<'static> {
         let t = self.tree.get(r.id).unwrap().clone();
+        if self.recent {
+            let when = t
+                .done_at
+                .as_deref()
+                .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
+                .map(|d| d.with_timezone(&Local).format("%a %b %d %H:%M").to_string())
+                .unwrap_or_default();
+            return Line::from(vec![
+                Span::styled(format!("{when}  "), Style::default().fg(Color::DarkGray)),
+                Span::styled("[x] ", Style::default().fg(Color::Green)),
+                Span::raw(self.tree.path(t.id)),
+            ]);
+        }
         let fold = match (self.tree.has_children(t.id), self.collapsed.contains(&t.id)) {
             (false, _) => "  ",
             (true, true) => "▸ ",
@@ -678,6 +712,7 @@ impl App {
 const HELP: &str = "\
 j/k ↑/↓     move            g/G   top / bottom
 space / x   toggle done     H     show older done items
+R           recently done, newest first (R again = tree)
 a           add below       A     add inside (child)
 e           edit title      d     delete
 D           set directory for new sessions (children inherit)

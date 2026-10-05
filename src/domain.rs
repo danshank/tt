@@ -108,6 +108,17 @@ impl Tree {
         parts.join(" › ")
     }
 
+    /// Done todos, most recently checked off first.
+    pub fn done_rows(&self) -> Vec<Row> {
+        let mut done: Vec<(chrono::DateTime<chrono::FixedOffset>, &Todo)> = self
+            .todos
+            .iter()
+            .filter_map(|t| Some((chrono::DateTime::parse_from_rfc3339(t.done_at.as_deref()?).ok()?, t)))
+            .collect();
+        done.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.id.cmp(&a.1.id)));
+        done.into_iter().map(|(_, t)| Row { id: t.id, depth: 0 }).collect()
+    }
+
     /// Depth-first visible rows. A hidden todo hides its whole subtree.
     pub fn rows(&self, collapsed: &HashSet<TodoId>, hidden: &dyn Fn(&Todo) -> bool) -> Vec<Row> {
         let mut out = Vec::new();
@@ -125,5 +136,29 @@ impl Tree {
                 self.walk(Some(t.id), depth + 1, collapsed, hidden, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn todo(id: TodoId, done_at: Option<&str>) -> Todo {
+        Todo { id, parent_id: None, position: id, title: id.to_string(), dir: None, done_at: done_at.map(str::to_string), created_at: String::new() }
+    }
+
+    #[test]
+    fn done_rows_newest_first() {
+        let tree = Tree {
+            todos: vec![
+                todo(1, Some("2026-10-01T09:00:00-04:00")),
+                todo(2, None),
+                todo(3, Some("2026-10-03T09:00:00-04:00")),
+                todo(4, Some("2026-10-03T13:30:00+01:00")),
+            ],
+            ..Default::default()
+        };
+        let ids: Vec<TodoId> = tree.done_rows().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 4, 1]);
     }
 }
