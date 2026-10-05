@@ -60,18 +60,23 @@ impl NameCache {
 }
 
 /// Args to `claude` that reopen a session: attach for background jobs, resume otherwise.
-fn open_args(session_id: &str) -> [&str; 2] {
+pub fn open_args(session_id: &str) -> Vec<String> {
     if is_background_job(session_id) {
-        ["attach", short(session_id)]
+        vec!["attach".into(), short(session_id).into()]
     } else {
-        ["--resume", session_id]
+        vec!["--resume".into(), session_id.into()]
     }
 }
 
-/// Command that reopens a session in the current terminal.
-pub fn open_command(session_id: &str, cwd: &str) -> Command {
+/// Args to `claude` that start a fresh session with a fixed id and opening prompt.
+pub fn start_args(session_id: &str, prompt: &str) -> Vec<String> {
+    vec!["--session-id".into(), session_id.into(), prompt.into()]
+}
+
+/// Command that runs `claude args` in the current terminal.
+pub fn claude_command(args: &[String], cwd: &str) -> Command {
     let mut cmd = Command::new("claude");
-    cmd.args(open_args(session_id));
+    cmd.args(args);
     if Path::new(cwd).is_dir() {
         cmd.current_dir(cwd);
     }
@@ -110,9 +115,9 @@ fn tmux(args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Open a session in its own window of the dedicated tmux session ($TT_TMUX_SESSION, default "claude"),
-/// reusing the window if one already runs it. `jump` switches the client there. Returns "session:index".
-pub fn tmux_open(session_id: &str, cwd: &str, name: &str, jump: bool) -> anyhow::Result<(String, bool)> {
+/// Run `claude args` for a session in its own window of the dedicated tmux session ($TT_TMUX_SESSION, default "claude"),
+/// reusing the window if one already runs it, and switch the client there. Returns "session:index".
+pub fn tmux_open(session_id: &str, claude_args: &[String], cwd: &str, name: &str) -> anyhow::Result<(String, bool)> {
     let existing = tmux(&["list-windows", "-a", "-F", "#{@tt_session}\t#{window_id}"])?
         .lines()
         .find_map(|l| l.split_once('\t').filter(|(s, _)| *s == session_id).map(|(_, w)| w.to_string()));
@@ -129,16 +134,14 @@ pub fn tmux_open(session_id: &str, cwd: &str, name: &str, jump: bool) -> anyhow:
                 vec!["new-session", "-s", &target]
             };
             args.extend(["-d", "-P", "-F", "#{window_id}", "-n", name, "-c", cwd, "claude"]);
-            args.extend(open_args(session_id));
+            args.extend(claude_args.iter().map(String::as_str));
             let w = tmux(&args)?;
             tmux(&["set-option", "-w", "-t", &w, "@tt_session", session_id])?;
             w
         }
     };
-    if jump {
-        tmux(&["select-window", "-t", &window])?;
-        tmux(&["switch-client", "-t", &window])?;
-    }
+    tmux(&["select-window", "-t", &window])?;
+    tmux(&["switch-client", "-t", &window])?;
     let label = tmux(&["display-message", "-p", "-t", &window, "#{session_name}:#{window_index}"])?;
     Ok((label, reused))
 }

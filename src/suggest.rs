@@ -29,11 +29,11 @@ pub fn build_prompt(tree: &Tree, reflection: &str, since: SystemTime) -> String 
     let mut todos = String::new();
     for row in tree.rows(&HashSet::new(), &|t| t.is_done()) {
         let t = tree.get(row.id).unwrap();
-        let sessions: Vec<String> = tree.sessions_for(t.id).iter().map(|s| names.get(&s.session_id).to_string()).collect();
+        let session = tree.session_for(t.id).map(|s| names.get(&s.session_id).to_string());
         let tickets = tree.tickets_for(t.id);
         todos.push_str(&format!("{}#{} {}", "  ".repeat(row.depth), t.id, t.title));
-        if !sessions.is_empty() {
-            todos.push_str(&format!("  [sessions: {}]", sessions.join(", ")));
+        if let Some(s) = session {
+            todos.push_str(&format!("  [session: {s}]"));
         }
         if !tickets.is_empty() {
             todos.push_str(&format!("  [tickets: {}]", tickets.join(", ")));

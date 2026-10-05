@@ -19,6 +19,7 @@ enum InputKind {
     Sibling,
     Child,
     Edit(TodoId),
+    Dir(TodoId),
     Timer,
 }
 
@@ -28,6 +29,7 @@ impl InputKind {
             InputKind::Sibling => "new todo",
             InputKind::Child => "new child todo",
             InputKind::Edit(_) => "edit",
+            InputKind::Dir(_) => "directory (empty clears)",
             InputKind::Timer => "timer minutes",
         }
     }
@@ -37,7 +39,6 @@ enum Mode {
     Normal,
     Input { kind: InputKind, buf: String },
     ConfirmDelete(TodoId),
-    PickSession { links: Vec<SessionLink>, idx: usize },
     Suggest { message: String, items: Vec<(Suggestion, bool)>, idx: usize },
     Help,
 }
@@ -101,6 +102,33 @@ fn suspend(terminal: &mut DefaultTerminal, cmd: &mut Command) -> std::io::Result
     *terminal = ratatui::init();
     let _ = terminal.clear();
     status
+}
+
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix('~'), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Split a partly typed path into the part up to the last '/' and the subdirectories there matching the rest.
+/// Hidden dirs only show once the typed name starts with '.'.
+fn dir_matches(buf: &str) -> (String, Vec<String>) {
+    let (head, prefix) = match buf.rfind('/') {
+        Some(i) => buf.split_at(i + 1),
+        None => ("", buf),
+    };
+    let base = if head.is_empty() { ".".to_string() } else { expand_home(head) };
+    let mut names: Vec<String> = std::fs::read_dir(&base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.')))
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    (head.to_string(), names)
 }
 
 fn notify(message: &str) {
@@ -274,6 +302,19 @@ impl App {
                     buf.pop();
                     Mode::Input { kind, buf }
                 }
+                KeyCode::Tab if matches!(kind, InputKind::Dir(_)) => {
+                    let (head, names) = dir_matches(&buf);
+                    if let [only] = names.as_slice() {
+                        buf = format!("{head}{only}/");
+                    } else if let Some(first) = names.first() {
+                        let lcp = names.iter().fold(first.as_str(), |acc, n| {
+                            let len = acc.char_indices().zip(n.chars()).take_while(|((_, a), b)| a == b).last().map_or(0, |((i, c), _)| i + c.len_utf8());
+                            &acc[..len]
+                        });
+                        buf = format!("{head}{lcp}");
+                    }
+                    Mode::Input { kind, buf }
+                }
                 KeyCode::Char(c) => {
                     buf.push(c);
                     Mode::Input { kind, buf }
@@ -287,27 +328,6 @@ impl App {
                 }
                 Mode::Normal
             }
-            Mode::PickSession { links, mut idx } => match k.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    idx = (idx + 1).min(links.len() - 1);
-                    Mode::PickSession { links, idx }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    idx = idx.saturating_sub(1);
-                    Mode::PickSession { links, idx }
-                }
-                KeyCode::Char('d') => {
-                    let l = &links[idx];
-                    let r = self.store.unlink_session(l.todo_id, &l.session_id);
-                    self.act(r, Some(l.todo_id));
-                    Mode::Normal
-                }
-                KeyCode::Enter | KeyCode::Char('o') => {
-                    self.open_session(&links[idx].clone(), k.code != KeyCode::Enter, terminal);
-                    return;
-                }
-                _ => Mode::Normal,
-            },
             Mode::Suggest { message, mut items, mut idx } => match k.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     idx = (idx + 1).min(items.len() - 1);
@@ -339,7 +359,7 @@ impl App {
     }
 
     fn prompt(&mut self, kind: InputKind, buf: String) {
-        if !sessions::in_tmux() {
+        if !sessions::in_tmux() || matches!(kind, InputKind::Dir(_)) {
             self.mode = Mode::Input { kind, buf };
             return;
         }
@@ -367,6 +387,16 @@ impl App {
                 let r = self.store.rename(id, &buf);
                 self.act(r, Some(id));
             }
+            InputKind::Dir(id) => {
+                let dir = expand_home(buf.trim());
+                let dir = if dir.len() > 1 { dir.trim_end_matches('/').to_string() } else { dir };
+                if !dir.is_empty() && !std::path::Path::new(&dir).is_dir() {
+                    self.status = format!("not a directory: {dir}");
+                    return;
+                }
+                let r = self.store.set_dir(id, (!dir.is_empty()).then_some(dir.as_str()));
+                self.act(r, Some(id));
+            }
             InputKind::Sibling | InputKind::Child => {
                 let (parent, index) = match (&kind, cur.and_then(|c| self.tree.get(c))) {
                     (_, None) => (None, None),
@@ -386,17 +416,42 @@ impl App {
         }
     }
 
-    fn open_session(&mut self, link: &SessionLink, jump: bool, terminal: &mut DefaultTerminal) {
+    fn open_session(&mut self, link: &SessionLink, terminal: &mut DefaultTerminal) {
         let name = self.names.get(&link.session_id).to_string();
+        self.launch(&link.session_id, &sessions::open_args(&link.session_id), &link.cwd, &name, terminal);
+    }
+
+    /// New Claude session seeded with the todo, opened in the todo's dir and claimed up front.
+    fn start_session(&mut self, id: TodoId, terminal: &mut DefaultTerminal) {
+        let Some(todo) = self.tree.get(id) else { return };
+        let name: String = todo.title.chars().take(30).collect();
+        let cwd = self.tree.dir_for(id).map(str::to_string).unwrap_or_else(|| {
+            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        });
+        let tickets = self.tree.tickets_for(id);
+        let mut prompt = format!("Let's work on todo #{id} from tt: {}", self.tree.path(id));
+        if !tickets.is_empty() {
+            prompt.push_str(&format!(" (Linear: {})", tickets.join(", ")));
+        }
+        let sid = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = self.store.link_session(id, &sid, &cwd) {
+            self.status = format!("couldn't claim: {e}");
+            return;
+        }
+        self.launch(&sid, &sessions::start_args(&sid, &prompt), &cwd, &name, terminal);
+        self.reload();
+    }
+
+    fn launch(&mut self, session_id: &str, args: &[String], cwd: &str, name: &str, terminal: &mut DefaultTerminal) {
         if sessions::in_tmux() {
-            self.status = match sessions::tmux_open(&link.session_id, &link.cwd, &name, jump) {
+            self.status = match sessions::tmux_open(session_id, args, cwd, name) {
                 Ok((at, false)) => format!("Opened “{name}” in {at}."),
                 Ok((at, true)) => format!("“{name}” already open in {at}."),
                 Err(e) => format!("couldn't open session: {e}"),
             };
             return;
         }
-        let mut cmd = sessions::open_command(&link.session_id, &link.cwd);
+        let mut cmd = sessions::claude_command(args, cwd);
         match suspend(terminal, &mut cmd) {
             Ok(_) => self.status = format!("Back from “{name}”."),
             Err(e) => self.status = format!("couldn't open session: {e}"),
@@ -444,6 +499,10 @@ impl App {
                 self.prompt(InputKind::Edit(id), buf);
             }
             KeyCode::Char('d') => self.mode = Mode::ConfirmDelete(id),
+            KeyCode::Char('D') => {
+                let buf = self.tree.dir_for(id).map(|d| format!("{}/", d.trim_end_matches('/'))).unwrap_or_else(|| "~/".into());
+                self.prompt(InputKind::Dir(id), buf);
+            }
             KeyCode::Tab => {
                 let r = self.store.indent(id);
                 if let Some(p) = self.store.load().ok().and_then(|t| t.get(id).and_then(|t| t.parent_id)) {
@@ -492,14 +551,10 @@ impl App {
                     self.act(r, Some(m));
                 }
             }
-            KeyCode::Enter | KeyCode::Char('o') => {
-                let links: Vec<SessionLink> = self.tree.sessions_for(id).into_iter().cloned().collect();
-                match links.len() {
-                    0 => self.status = "Not attached to a session. Run /claim inside one.".into(),
-                    1 => self.open_session(&links[0], k.code != KeyCode::Enter, terminal),
-                    _ => self.mode = Mode::PickSession { links, idx: 0 },
-                }
-            }
+            KeyCode::Char('o') => match self.tree.session_for(id).cloned() {
+                Some(link) => self.open_session(&link, terminal),
+                None => self.start_session(id, terminal),
+            },
             _ => {}
         }
     }
@@ -527,6 +582,17 @@ impl App {
         match &self.mode {
             Mode::Normal => {}
             Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 24),
+            Mode::Input { kind: kind @ InputKind::Dir(_), buf } => {
+                let (_, names) = dir_matches(buf);
+                let mut lines = vec![Line::from(format!("{buf}▏"))];
+                lines.extend(names.iter().take(8).map(|n| Line::from(format!("  {n}/")).style(Style::default().fg(Color::DarkGray))));
+                if names.len() > 8 {
+                    lines.push(Line::from(format!("  … {} more", names.len() - 8)).style(Style::default().fg(Color::DarkGray)));
+                }
+                lines.resize(10, Line::from(""));
+                lines.push(Line::from("tab complete · ⏎ save · esc cancel").style(Style::default().fg(Color::DarkGray)));
+                popup(f, kind.label(), lines, 70, 13);
+            }
             Mode::Input { kind, buf } => {
                 popup(f, kind.label(), vec![Line::from(format!("{buf}▏"))], 70, 3);
             }
@@ -535,20 +601,6 @@ impl App {
                 let extra = if n > 0 { format!(" and {n} nested") } else { String::new() };
                 let title = self.tree.get(*id).map(|t| t.title.clone()).unwrap_or_default();
                 popup(f, "delete", vec![Line::from(format!("Delete “{title}”{extra}? y / n"))], 70, 3);
-            }
-            Mode::PickSession { links, idx } => {
-                let lines: Vec<Line> = links
-                    .iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        let name = self.names.get(&l.session_id).to_string();
-                        let s = format!("{} {}  ({})", if i == *idx { "›" } else { " " }, name, &l.session_id[..8.min(l.session_id.len())]);
-                        Line::from(s)
-                    })
-                    .chain([Line::from(""), Line::from("⏎ open · o open + jump · d detach · esc cancel").style(Style::default().fg(Color::DarkGray))])
-                    .collect();
-                let h = lines.len() as u16 + 2;
-                popup(f, "sessions", lines, 70, h);
             }
             Mode::Suggest { message, items, idx } => {
                 let mut lines = vec![Line::from(message.clone()), Line::from("")];
@@ -584,11 +636,9 @@ impl App {
             title_style = title_style.fg(Color::Yellow).add_modifier(Modifier::ITALIC);
         }
         spans.push(Span::styled(t.title.clone(), title_style));
-        let links = self.tree.sessions_for(t.id).into_iter().cloned().collect::<Vec<_>>();
-        if let Some(first) = links.first() {
-            let more = if links.len() > 1 { format!(" +{}", links.len() - 1) } else { String::new() };
-            let name = self.names.get(&first.session_id).to_string();
-            spans.push(Span::styled(format!("  ⇢ {name}{more}"), Style::default().fg(Color::Magenta)));
+        if let Some(link) = self.tree.session_for(t.id).cloned() {
+            let name = self.names.get(&link.session_id).to_string();
+            spans.push(Span::styled(format!("  ⇢ {name}"), Style::default().fg(Color::Magenta)));
         }
         for key in self.tree.tickets_for(t.id) {
             spans.push(Span::styled(format!("  {key}"), Style::default().fg(Color::Cyan)));
@@ -598,9 +648,12 @@ impl App {
 
     fn detail_lines(&mut self) -> Vec<Line<'static>> {
         let Some(id) = self.selected() else { return vec![] };
-        let mut lines = vec![Line::from(Span::styled(self.tree.path(id), Style::default().add_modifier(Modifier::BOLD)))];
-        let links = self.tree.sessions_for(id).into_iter().cloned().collect::<Vec<_>>();
-        if let Some(l) = links.first() {
+        let mut first = vec![Span::styled(self.tree.path(id), Style::default().add_modifier(Modifier::BOLD))];
+        if let Some(d) = self.tree.dir_for(id) {
+            first.push(Span::styled(format!("  in {d}"), Style::default().fg(Color::DarkGray)));
+        }
+        let mut lines = vec![Line::from(first)];
+        if let Some(l) = self.tree.session_for(id).cloned() {
             let status = sessions::job_detail(&l.session_id).unwrap_or_else(|| l.cwd.clone());
             let name = self.names.get(&l.session_id).to_string();
             lines.push(Line::from(Span::styled(format!("⇢ {name}: {status}"), Style::default().fg(Color::DarkGray))));
@@ -627,13 +680,13 @@ j/k ↑/↓     move            g/G   top / bottom
 space / x   toggle done     H     show older done items
 a           add below       A     add inside (child)
 e           edit title      d     delete
+D           set directory for new sessions (children inherit)
 Tab         nest under item above
 Shift-Tab   un-nest
 J / K       move down / up among siblings
 h/l ←/→     collapse / expand
 m then p    move item inside another (P = after it)
-⏎           open its Claude session (tmux: background window)
-o           open and jump to it
+o           open its Claude session, or start one in its directory
 
 t           start a timer (minutes)
 T           stop timer
@@ -656,4 +709,23 @@ fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, width: u16, height: u16) 
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(format!(" {title} ")));
     f.render_widget(p, r);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dir_matches;
+
+    #[test]
+    fn completes_subdirs() {
+        let root = std::env::temp_dir().join(format!("tt-dirs-{}", std::process::id()));
+        for d in ["alpha", "alps", "beta", ".hidden"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("alfile"), "").unwrap();
+        let base = format!("{}/", root.display());
+        assert_eq!(dir_matches(&format!("{base}al")), (base.clone(), vec!["alpha".into(), "alps".into()]));
+        assert_eq!(dir_matches(&base).1, vec!["alpha", "alps", "beta"]);
+        assert_eq!(dir_matches(&format!("{base}.h")).1, vec![".hidden"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

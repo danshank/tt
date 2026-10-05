@@ -9,6 +9,7 @@ pub struct Todo {
     pub parent_id: Option<TodoId>,
     pub position: i64,
     pub title: String,
+    pub dir: Option<String>,
     pub done_at: Option<String>,
     pub created_at: String,
 }
@@ -63,10 +64,8 @@ impl Tree {
         self.todos.iter().any(|t| t.parent_id == Some(id))
     }
 
-    pub fn sessions_for(&self, id: TodoId) -> Vec<&SessionLink> {
-        let mut s: Vec<&SessionLink> = self.sessions.iter().filter(|s| s.todo_id == id).collect();
-        s.sort_by(|a, b| b.linked_at.cmp(&a.linked_at));
-        s
+    pub fn session_for(&self, id: TodoId) -> Option<&SessionLink> {
+        self.sessions.iter().find(|s| s.todo_id == id)
     }
 
     pub fn tickets_for(&self, id: TodoId) -> Vec<&str> {
@@ -83,6 +82,18 @@ impl Tree {
             cur = self.get(c).and_then(|t| t.parent_id);
         }
         false
+    }
+
+    /// Working dir for new sessions: the todo's own, else the nearest ancestor's.
+    pub fn dir_for(&self, id: TodoId) -> Option<&str> {
+        let mut cur = self.get(id);
+        while let Some(t) = cur {
+            if let Some(d) = &t.dir {
+                return Some(d);
+            }
+            cur = t.parent_id.and_then(|p| self.get(p));
+        }
+        None
     }
 
     /// Titles from root down to `id`, e.g. "Lattice removal › Rebase #1935".

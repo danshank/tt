@@ -58,6 +58,13 @@ enum Cmd {
     Ticket { id: TodoId, key: String },
     /// Mark a todo done
     Done { id: TodoId },
+    /// Set the directory new sessions for a todo start in (default: cwd); --clear unsets it
+    Dir {
+        id: TodoId,
+        path: Option<String>,
+        #[arg(long, conflicts_with = "path")]
+        clear: bool,
+    },
 }
 
 fn session_id(arg: Option<String>) -> Result<String> {
@@ -81,9 +88,8 @@ fn print_tree(store: &Store, all: bool) -> Result<()> {
     for r in rows {
         let t = tree.get(r.id).unwrap();
         let mut line = format!("{:>4}  {}{} {}", t.id, "  ".repeat(r.depth), if t.is_done() { "[x]" } else { "[ ]" }, t.title);
-        let s: Vec<String> = tree.sessions_for(t.id).iter().map(|l| names.get(&l.session_id).to_string()).collect();
-        if !s.is_empty() {
-            line.push_str(&format!("  ⇢ {}", s.join(", ")));
+        if let Some(l) = tree.session_for(t.id) {
+            line.push_str(&format!("  ⇢ {}", names.get(&l.session_id)));
         }
         let k = tree.tickets_for(t.id);
         if !k.is_empty() {
@@ -141,6 +147,16 @@ fn main() -> Result<()> {
         Some(Cmd::Done { id }) => {
             store.set_done(id, true)?;
             println!("done #{id}");
+        }
+        Some(Cmd::Dir { id, path, clear }) => {
+            if clear {
+                store.set_dir(id, None)?;
+                println!("cleared dir for #{id}");
+            } else {
+                let dir = std::fs::canonicalize(path.unwrap_or_else(cwd))?.display().to_string();
+                store.set_dir(id, Some(&dir))?;
+                println!("#{id} sessions start in {dir}");
+            }
         }
     }
     Ok(())

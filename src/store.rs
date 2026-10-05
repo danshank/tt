@@ -67,11 +67,16 @@ impl Store {
                  body TEXT NOT NULL
              );",
         )?;
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS session_links_todo ON session_links (todo_id)", [])?;
+        let has_dir: bool = conn.prepare("SELECT 1 FROM pragma_table_info('todos') WHERE name = 'dir'")?.exists([])?;
+        if !has_dir {
+            conn.execute("ALTER TABLE todos ADD COLUMN dir TEXT", [])?;
+        }
         Ok(Self { conn })
     }
 
     pub fn load(&self) -> Result<Tree> {
-        let mut st = self.conn.prepare("SELECT id, parent_id, position, title, done_at, created_at FROM todos")?;
+        let mut st = self.conn.prepare("SELECT id, parent_id, position, title, done_at, created_at, dir FROM todos")?;
         let todos = st
             .query_map([], |r| {
                 Ok(Todo {
@@ -81,6 +86,7 @@ impl Store {
                     title: r.get(3)?,
                     done_at: r.get(4)?,
                     created_at: r.get(5)?,
+                    dir: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -171,6 +177,12 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_dir(&self, id: TodoId, dir: Option<&str>) -> Result<()> {
+        self.require(id)?;
+        self.conn.execute("UPDATE todos SET dir = ?1 WHERE id = ?2", params![dir, id])?;
+        Ok(())
+    }
+
     pub fn set_done(&self, id: TodoId, done: bool) -> Result<()> {
         self.require(id)?;
         let at = done.then(now);
@@ -211,11 +223,12 @@ impl Store {
         self.place(id, parent, to as usize)
     }
 
+    /// Attach `session_id` to a todo, replacing any session it had.
     pub fn link_session(&self, id: TodoId, session_id: &str, cwd: &str) -> Result<()> {
         self.require(id)?;
         self.conn.execute(
             "INSERT INTO session_links (todo_id, session_id, cwd, linked_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (todo_id, session_id) DO UPDATE SET cwd = excluded.cwd, linked_at = excluded.linked_at",
+             ON CONFLICT (todo_id) DO UPDATE SET session_id = excluded.session_id, cwd = excluded.cwd, linked_at = excluded.linked_at",
             params![id, session_id, cwd, now()],
         )?;
         Ok(())
@@ -291,6 +304,31 @@ mod tests {
         s.delete(a).unwrap();
         let t = s.load().unwrap();
         assert!(t.todos.is_empty() && t.sessions.is_empty() && t.tickets.is_empty());
+    }
+
+    #[test]
+    fn one_session_per_todo() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add("a", None, None).unwrap();
+        s.link_session(a, "one", "/tmp").unwrap();
+        s.link_session(a, "two", "/tmp").unwrap();
+        let t = s.load().unwrap();
+        assert_eq!(t.sessions.len(), 1);
+        assert_eq!(t.session_for(a).unwrap().session_id, "two");
+    }
+
+    #[test]
+    fn dir_inherits_from_ancestors() {
+        let s = Store::in_memory().unwrap();
+        let a = s.add("a", None, None).unwrap();
+        let b = s.add("b", Some(a), None).unwrap();
+        assert_eq!(s.load().unwrap().dir_for(b), None);
+        s.set_dir(a, Some("/x")).unwrap();
+        assert_eq!(s.load().unwrap().dir_for(b), Some("/x"));
+        s.set_dir(b, Some("/y")).unwrap();
+        assert_eq!(s.load().unwrap().dir_for(b), Some("/y"));
+        s.set_dir(b, None).unwrap();
+        assert_eq!(s.load().unwrap().dir_for(b), Some("/x"));
     }
 
     #[test]
