@@ -637,13 +637,13 @@ impl App {
                 let n = self.tree.todos.iter().filter(|t| t.id != *id && self.tree.is_within(t.id, *id)).count();
                 let extra = if n > 0 { format!(" and {n} nested") } else { String::new() };
                 let title = self.tree.get(*id).map(|t| t.title.clone()).unwrap_or_default();
-                popup(f, "delete", vec![Line::from(format!("Delete “{title}”{extra}? y / n"))], 70, 3);
+                confirm(f, "delete", format!("Delete “{title}”{extra}?"));
             }
             Mode::ConfirmUnclaim(id) => {
                 let sid = self.tree.session_for(*id).map(|l| l.session_id.clone()).unwrap_or_default();
                 let name = self.names.get(&sid).to_string();
                 let title = self.tree.get(*id).map(|t| t.title.clone()).unwrap_or_default();
-                popup(f, "unclaim", vec![Line::from(format!("Detach “{name}” from “{title}”? y / n"))], 70, 3);
+                confirm(f, "unclaim", format!("Detach “{name}” from “{title}”?"));
             }
             Mode::Suggest { message, items, idx } => {
                 let mut lines = vec![Line::from(message.clone()), Line::from("")];
@@ -756,6 +756,15 @@ checks your sessions and suggests check-offs.
 
 Link sessions from inside Claude with /claim.
 q           quit";
+
+/// Yes/no popup: the question, wrapped, with the y / n hint pinned to the bottom.
+fn confirm(f: &mut Frame, title: &str, question: String) {
+    let width = 70;
+    let inner = width.min(f.area().width.saturating_sub(2)).saturating_sub(2);
+    let n = Paragraph::new(question.as_str()).wrap(Wrap { trim: false }).line_count(inner) as u16;
+    let lines = vec![Line::from(question), Line::from(""), Line::from("y / n").style(Style::default().fg(Color::DarkGray))];
+    popup(f, title, lines, width, n + 4);
+}
 
 fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, width: u16, height: u16) {
     let area = f.area();
