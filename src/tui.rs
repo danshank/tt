@@ -39,6 +39,7 @@ enum Mode {
     Normal,
     Input { kind: InputKind, buf: String },
     ConfirmDelete(TodoId),
+    ConfirmUnclaim(TodoId),
     Suggest { message: String, items: Vec<(Suggestion, bool)>, idx: usize },
     Help,
 }
@@ -330,6 +331,17 @@ impl App {
                 }
                 Mode::Normal
             }
+            Mode::ConfirmUnclaim(id) => {
+                if k.code == KeyCode::Char('y') {
+                    if let Some(link) = self.tree.session_for(id).cloned() {
+                        let name = self.names.get(&link.session_id).to_string();
+                        let r = self.store.unlink_session(id, &link.session_id);
+                        self.status = format!("Detached “{name}”.");
+                        self.act(r, Some(id));
+                    }
+                }
+                Mode::Normal
+            }
             Mode::Suggest { message, mut items, mut idx } => match k.code {
                 KeyCode::Char('j') | KeyCode::Down => {
                     idx = (idx + 1).min(items.len() - 1);
@@ -571,6 +583,10 @@ impl App {
                 Some(link) => self.open_session(&link, terminal),
                 None => self.start_session(id, terminal),
             },
+            KeyCode::Char('u') => match self.tree.session_for(id) {
+                Some(_) => self.mode = Mode::ConfirmUnclaim(id),
+                None => self.status = "No session to detach.".into(),
+            },
             _ => {}
         }
     }
@@ -602,7 +618,7 @@ impl App {
 
         match &self.mode {
             Mode::Normal => {}
-            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 26),
+            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 27),
             Mode::Input { kind: kind @ InputKind::Dir(_), buf } => {
                 let (_, names) = dir_matches(buf);
                 let mut lines = vec![Line::from(format!("{buf}▏"))];
@@ -622,6 +638,12 @@ impl App {
                 let extra = if n > 0 { format!(" and {n} nested") } else { String::new() };
                 let title = self.tree.get(*id).map(|t| t.title.clone()).unwrap_or_default();
                 popup(f, "delete", vec![Line::from(format!("Delete “{title}”{extra}? y / n"))], 70, 3);
+            }
+            Mode::ConfirmUnclaim(id) => {
+                let sid = self.tree.session_for(*id).map(|l| l.session_id.clone()).unwrap_or_default();
+                let name = self.names.get(&sid).to_string();
+                let title = self.tree.get(*id).map(|t| t.title.clone()).unwrap_or_default();
+                popup(f, "unclaim", vec![Line::from(format!("Detach “{name}” from “{title}”? y / n"))], 70, 3);
             }
             Mode::Suggest { message, items, idx } => {
                 let mut lines = vec![Line::from(message.clone()), Line::from("")];
@@ -722,6 +744,7 @@ J / K       move down / up among siblings
 h/l ←/→     collapse / expand
 m then p    move item inside another (P = after it)
 o           open its Claude session, or start one in its directory
+u           detach its Claude session (unclaim)
 
 t           start a timer (minutes)
 T           stop timer
