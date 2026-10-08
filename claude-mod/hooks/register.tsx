@@ -9,18 +9,13 @@ const PANE = 'tt-claim'
 const rows = atom({ plugin: 'tt-claim', key: 'rows' } as const, [])
 const error = atom({ plugin: 'tt-claim', key: 'error' } as const, '')
 
-const TT = ['tt', '/Users/dan/Software/personal/tt/target/debug/tt']
-
 async function tt($: EngineInterface, args: string[]) {
   const cwd = await $.session.cwd()
-  for (const bin of TT) {
-    try {
-      return await $.process.run([bin, ...args], { cwd })
-    } catch {
-      // try the next location
-    }
+  try {
+    return await $.process.run(['tt', ...args], { cwd })
+  } catch {
+    throw new Error('tt not found on PATH')
   }
-  throw new Error('tt not found on PATH or in target/debug')
 }
 
 async function loadTree($: EngineInterface): Promise<TreeJson> {
