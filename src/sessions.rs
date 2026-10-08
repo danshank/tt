@@ -15,6 +15,11 @@ pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
     std::fs::read_dir(projects).ok()?.flatten().map(|d| d.path().join(format!("{session_id}.jsonl"))).find(|p| p.exists())
 }
 
+/// When the session last wrote to its transcript.
+pub fn last_active(session_id: &str) -> Option<SystemTime> {
+    std::fs::metadata(transcript_path(session_id)?).ok()?.modified().ok()
+}
+
 fn short(session_id: &str) -> &str {
     &session_id[..session_id.len().min(8)]
 }

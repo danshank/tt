@@ -119,6 +119,18 @@ impl Tree {
         done.into_iter().map(|(_, t)| Row { id: t.id, depth: 0 }).collect()
     }
 
+    /// Open todos with a linked session, most recently active first. Undated sessions sink to the bottom.
+    pub fn active_rows<T: Ord>(&self, last_active: &dyn Fn(&SessionLink) -> Option<T>) -> Vec<Row> {
+        let mut active: Vec<(Option<T>, TodoId)> = self
+            .todos
+            .iter()
+            .filter(|t| !t.is_done())
+            .filter_map(|t| Some((last_active(self.session_for(t.id)?), t.id)))
+            .collect();
+        active.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        active.into_iter().map(|(_, id)| Row { id, depth: 0 }).collect()
+    }
+
     /// Depth-first visible rows. A hidden todo hides its whole subtree.
     pub fn rows(&self, collapsed: &HashSet<TodoId>, hidden: &dyn Fn(&Todo) -> bool) -> Vec<Row> {
         let mut out = Vec::new();
@@ -160,5 +172,23 @@ mod tests {
         };
         let ids: Vec<TodoId> = tree.done_rows().iter().map(|r| r.id).collect();
         assert_eq!(ids, vec![3, 4, 1]);
+    }
+
+    #[test]
+    fn active_rows_open_claimed_by_recency() {
+        let link = |todo_id, sid: &str| SessionLink { todo_id, session_id: sid.into(), cwd: String::new(), linked_at: String::new() };
+        let tree = Tree {
+            todos: vec![todo(1, None), todo(2, None), todo(3, Some("2026-10-03T09:00:00-04:00")), todo(4, None), todo(5, None)],
+            sessions: vec![link(1, "a"), link(2, "b"), link(3, "c"), link(5, "e")],
+            ..Default::default()
+        };
+        let when = |l: &SessionLink| match l.session_id.as_str() {
+            "a" => Some(10),
+            "b" => Some(30),
+            "c" => Some(40),
+            _ => None,
+        };
+        let ids: Vec<TodoId> = tree.active_rows(&when).iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 1, 5]);
     }
 }

@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime};
@@ -44,6 +44,13 @@ enum Mode {
     Help,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Tree,
+    Completed,
+    InProgress,
+}
+
 struct Timer {
     minutes: f64,
     ends: Instant,
@@ -56,8 +63,8 @@ struct App {
     cursor: usize,
     collapsed: HashSet<TodoId>,
     show_all_done: bool,
-    recent: bool,
-    moving: Option<TodoId>,
+    view: View,
+    active_at: HashMap<TodoId, SystemTime>,
     mode: Mode,
     timer: Option<Timer>,
     block_start: DateTime<Local>,
@@ -76,8 +83,8 @@ pub fn run(store: Store) -> Result<()> {
         cursor: 0,
         collapsed: HashSet::new(),
         show_all_done: false,
-        recent: false,
-        moving: None,
+        view: View::Tree,
+        active_at: HashMap::new(),
         mode: Mode::Normal,
         timer: None,
         block_start: Local::now(),
@@ -165,7 +172,21 @@ impl App {
         let today = today();
         let show_all = self.show_all_done;
         let hidden = move |t: &Todo| !show_all && t.done_at.as_deref().is_some_and(|d| !d.starts_with(&today));
-        self.rows = if self.recent { self.tree.done_rows() } else { self.tree.rows(&self.collapsed, &hidden) };
+        self.rows = match self.view {
+            View::Tree => self.tree.rows(&self.collapsed, &hidden),
+            View::Completed => self.tree.done_rows(),
+            View::InProgress => {
+                self.active_at = self
+                    .tree
+                    .sessions
+                    .iter()
+                    .filter(|l| self.tree.get(l.todo_id).is_some_and(|t| !t.is_done()))
+                    .filter_map(|l| Some((l.todo_id, sessions::last_active(&l.session_id)?)))
+                    .collect();
+                let at = &self.active_at;
+                self.tree.active_rows(&|l: &SessionLink| at.get(&l.todo_id).copied())
+            }
+        };
         if let Some(id) = keep {
             if let Some(i) = self.rows.iter().position(|r| r.id == id) {
                 self.cursor = i;
@@ -473,6 +494,15 @@ impl App {
         self.reload();
     }
 
+    fn switch_view(&mut self, view: View, cur: Option<TodoId>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.cursor = 0;
+        self.recompute(cur);
+    }
+
     fn on_normal(&mut self, k: KeyEvent, terminal: &mut DefaultTerminal) {
         let cur = self.selected();
         let last = self.rows.len().saturating_sub(1);
@@ -485,8 +515,8 @@ impl App {
             KeyCode::Char('G') => self.cursor = last,
             KeyCode::Char('a') => self.prompt(InputKind::Sibling, String::new()),
             KeyCode::Char('A') => self.prompt(InputKind::Child, String::new()),
-            KeyCode::Char('t') => self.prompt(InputKind::Timer, "25".into()),
-            KeyCode::Char('T') => {
+            KeyCode::Char('s') => self.prompt(InputKind::Timer, "25".into()),
+            KeyCode::Char('S') => {
                 self.timer = None;
                 self.status = "Timer stopped.".into();
             }
@@ -495,29 +525,23 @@ impl App {
                 self.show_all_done = !self.show_all_done;
                 self.recompute(cur);
             }
-            KeyCode::Char('R') => {
-                self.recent = !self.recent;
-                self.moving = None;
-                self.cursor = 0;
-                self.recompute(cur);
-            }
-            KeyCode::Esc => {
-                self.moving = None;
-                self.status.clear();
-            }
+            KeyCode::Char('t') => self.switch_view(View::Tree, cur),
+            KeyCode::Char('c') => self.switch_view(View::Completed, cur),
+            KeyCode::Char('p') => self.switch_view(View::InProgress, cur),
+            KeyCode::Esc => self.status.clear(),
             _ => {}
         }
         let Some(id) = cur else { return };
         let structural = matches!(
             k.code,
-            KeyCode::Char('a' | 'A' | 'J' | 'K' | 'h' | 'l' | 'm' | 'p' | 'P') | KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+            KeyCode::Char('a' | 'A' | 'J' | 'K' | 'h' | 'l') | KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
         );
-        if self.recent && structural {
-            self.status = "Not in recent view. R to go back to the tree.".into();
+        if self.view != View::Tree && structural {
+            self.status = "Not in this view. t to go back to todos.".into();
             return;
         }
         match k.code {
-            KeyCode::Char(' ') | KeyCode::Char('x') => {
+            KeyCode::Char(' ') => {
                 let done = self.tree.get(id).is_some_and(|t| t.is_done());
                 let r = self.store.set_done(id, !done);
                 self.act(r, Some(id));
@@ -526,8 +550,8 @@ impl App {
                 let buf = self.tree.get(id).map(|t| t.title.clone()).unwrap_or_default();
                 self.prompt(InputKind::Edit(id), buf);
             }
-            KeyCode::Char('d') => self.mode = Mode::ConfirmDelete(id),
-            KeyCode::Char('D') => {
+            KeyCode::Char('x') => self.mode = Mode::ConfirmDelete(id),
+            KeyCode::Char('d') => {
                 let buf = self.tree.dir_for(id).map(|d| format!("{}/", d.trim_end_matches('/'))).unwrap_or_else(|| "~/".into());
                 self.prompt(InputKind::Dir(id), buf);
             }
@@ -562,23 +586,6 @@ impl App {
                 self.collapsed.remove(&id);
                 self.recompute(Some(id));
             }
-            KeyCode::Char('m') => {
-                self.moving = Some(id);
-                self.status = "Moving. Go to target: p = put inside, P = put after, Esc = cancel.".into();
-            }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                if let Some(m) = self.moving.take() {
-                    let r = if k.code == KeyCode::Char('p') {
-                        self.collapsed.remove(&id);
-                        self.store.place(m, Some(id), usize::MAX)
-                    } else {
-                        let t = self.tree.get(id).unwrap();
-                        self.store.place(m, t.parent_id, t.position as usize + 1)
-                    };
-                    self.status.clear();
-                    self.act(r, Some(m));
-                }
-            }
             KeyCode::Char('o') => match self.tree.session_for(id).cloned() {
                 Some(link) => self.open_session(&link, terminal),
                 None => self.start_session(id, terminal),
@@ -597,10 +604,11 @@ impl App {
 
         let rows = self.rows.clone();
         let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(self.row_line(r))).collect();
-        let title = match (self.recent, self.show_all_done) {
-            (true, _) => " recently done ",
-            (false, true) => " todos (all) ",
-            (false, false) => " todos ",
+        let title = match (self.view, self.show_all_done) {
+            (View::Completed, _) => " recently completed ",
+            (View::InProgress, _) => " in progress ",
+            (View::Tree, true) => " todos (all) ",
+            (View::Tree, false) => " todos ",
         };
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
@@ -608,7 +616,11 @@ impl App {
         let mut state = ListState::default().with_selected((!self.rows.is_empty()).then_some(self.cursor));
         f.render_stateful_widget(list, main, &mut state);
         if self.rows.is_empty() {
-            let hint = if self.recent { "Nothing checked off yet." } else { "No todos yet. Press a to add one." };
+            let hint = match self.view {
+                View::Tree => "No todos yet. Press a to add one.",
+                View::Completed => "Nothing checked off yet.",
+                View::InProgress => "No open todos with a Claude session. o on a todo starts one.",
+            };
             let hint = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
             f.render_widget(hint, Rect { x: main.x + 2, y: main.y + 1, width: main.width.saturating_sub(4), height: 1 });
         }
@@ -618,7 +630,7 @@ impl App {
 
         match &self.mode {
             Mode::Normal => {}
-            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 27),
+            Mode::Help => popup(f, "keys", HELP.lines().map(Line::from).collect(), 60, 28),
             Mode::Input { kind: kind @ InputKind::Dir(_), buf } => {
                 let (_, names) = dir_matches(buf);
                 let mut lines = vec![Line::from(format!("{buf}▏"))];
@@ -663,7 +675,21 @@ impl App {
 
     fn row_line(&mut self, r: &Row) -> Line<'static> {
         let t = self.tree.get(r.id).unwrap().clone();
-        if self.recent {
+        if self.view == View::InProgress {
+            let when = self
+                .active_at
+                .get(&t.id)
+                .map(|&at| DateTime::<Local>::from(at).format("%a %b %d %H:%M").to_string())
+                .unwrap_or_else(|| format!("{:16}", "—"));
+            let mut spans = vec![
+                Span::styled(format!("{when}  "), Style::default().fg(Color::DarkGray)),
+                Span::raw("[ ] "),
+                Span::raw(self.tree.path(t.id)),
+            ];
+            spans.extend(self.link_spans(t.id));
+            return Line::from(spans);
+        }
+        if self.view == View::Completed {
             let when = t
                 .done_at
                 .as_deref()
@@ -687,19 +713,23 @@ impl App {
             Span::styled(fold, Style::default().fg(Color::DarkGray)),
             Span::styled(if done { "[x] " } else { "[ ] " }, Style::default().fg(if done { Color::Green } else { Color::Reset })),
         ];
-        let mut title_style = if done { Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT) } else { Style::default() };
-        if self.moving == Some(t.id) {
-            title_style = title_style.fg(Color::Yellow).add_modifier(Modifier::ITALIC);
-        }
+        let title_style = if done { Style::default().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT) } else { Style::default() };
         spans.push(Span::styled(t.title.clone(), title_style));
-        if let Some(link) = self.tree.session_for(t.id).cloned() {
+        spans.extend(self.link_spans(t.id));
+        Line::from(spans)
+    }
+
+    /// Session name and ticket keys trailing a todo's title.
+    fn link_spans(&mut self, id: TodoId) -> Vec<Span<'static>> {
+        let mut spans = vec![];
+        if let Some(link) = self.tree.session_for(id).cloned() {
             let name = self.names.get(&link.session_id).to_string();
             spans.push(Span::styled(format!("  ⇢ {name}"), Style::default().fg(Color::Magenta)));
         }
-        for key in self.tree.tickets_for(t.id) {
+        for key in self.tree.tickets_for(id) {
             spans.push(Span::styled(format!("  {key}"), Style::default().fg(Color::Cyan)));
         }
-        Line::from(spans)
+        spans
     }
 
     fn detail_lines(&mut self) -> Vec<Line<'static>> {
@@ -732,22 +762,24 @@ impl App {
 }
 
 const HELP: &str = "\
+t           todos           H     show older done items
+c           recently completed, newest first
+p           in progress (has a session), most recent first
+
 j/k ↑/↓     move            g/G   top / bottom
-space / x   toggle done     H     show older done items
-R           recently done, newest first (R again = tree)
+space       toggle done
 a           add below       A     add inside (child)
-e           edit title      d     delete
-D           set directory for new sessions (children inherit)
+e           edit title      x     delete
+d           directory new sessions start in (inherited)
 Tab         nest under item above
 Shift-Tab   un-nest
 J / K       move down / up among siblings
 h/l ←/→     collapse / expand
-m then p    move item inside another (P = after it)
-o           open its Claude session, or start one in its directory
+o           open its Claude session, or start one
 u           detach its Claude session (unclaim)
 
-t           start a timer (minutes)
-T           stop timer
+s           start a timer (minutes)
+S           stop timer
 r           reflect now
 
 When the timer ends you get a notification and a
