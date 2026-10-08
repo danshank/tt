@@ -1,6 +1,6 @@
 # tt
 
-Todo tree linked to Claude Code sessions. Nest todos, start or resume a Claude session from any of them, and have Claude suggest check-offs after you reflect on a work block.
+Todo tree linked to Claude Code sessions. Nest todos, start or resume a Claude session from any of them, and have Claude suggest check-offs after you reflect on a work block. See [MOTIVATION.md](MOTIVATION.md) for why it exists.
 
 ## Install
 
